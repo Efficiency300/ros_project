@@ -1,0 +1,130 @@
+lane_detector_node:
+  ros__parameters:
+
+    # ── Performance ───────────────────────────────────────────────────────
+    # Resize the raw image before ALL processing.
+    # 1.0 → no resize; camera already publishes at 320×240.
+    resize_factor: 1.0
+
+    # Set true ONLY during calibration to publish three debug image topics.
+    # Leave false during autonomous driving (saves ~40 ms per frame on RPi).
+    debug_mode: false
+
+    # ── Perspective transform (bird's-eye view warp) ──────────────────────
+    # 8 integers defining a trapezoid in the ORIGINAL 640×480 camera image.
+    # Order: bottom-left-x, bottom-left-y,
+    #        bottom-right-x, bottom-right-y,
+    #        top-right-x, top-right-y,
+    #        top-left-x, top-left-y
+    #
+    # CALIBRATION PROCEDURE:
+    #   1. Run: ros2 launch turtlebot3_lane_follower lane_detection.launch.py
+    #   2. Open rqt → Image View → /lane/image_lane_debug
+    #   3. Adjust the 8 values below until both lane lines appear as
+    #      vertical, parallel lines in /lane/image_projected.
+    #   4. The trapezoid should tightly enclose the visible track ahead.
+    #
+    # Defaults are starting estimates for the TurtleBot3 Burger camera at
+    # its default mounting position (front, slight downward tilt), 320×240.
+    perspective_src: [6, 409, 639, 402, 571, 16, 82, 19]
+
+    # ── Yellow HSV colour range ───────────────────────────────────────────
+    # Tune using /lane/image_yellow_mask in rqt:
+    #   - Lane lines should appear SOLID WHITE
+    #   - Track surface / background should appear BLACK
+    #   - No isolated blobs from reflections (morphological opening handles small ones)
+    #
+    # OpenCV HSV ranges: H [0–179], S [0–255], V [0–255]
+    # Typical yellow tape under indoor fluorescent light: H ~22–30
+    # Under warm/incandescent light the hue may shift; widen yellow_h_max if needed.
+    yellow_h_min: 9
+    yellow_h_max: 43
+    yellow_s_min: 39
+    yellow_s_max: 255
+    yellow_v_min: 90
+    yellow_v_max: 255
+
+    # ── Sliding window search ─────────────────────────────────────────────
+    # n_windows: number of horizontal windows stacked from bottom to top.
+    #   More windows → finer curve tracking, higher CPU cost.
+    n_windows: 10
+
+    # window_margin: half-width (pixels, in resized image) of each search window.
+    #   Wider → catches faster lateral lane movement per frame, but more noise.
+    #   Narrower → more precise, but may lose lane if robot moves quickly.
+    window_margin: 60
+
+    # min_pixels: minimum white pixels inside a window to accept its centroid.
+    #   Lower → more sensitive but noisier. Higher → misses thin/faded lines.
+    min_pixels: 50
+
+    # min_lane_pixels: total white pixels across all windows for a lane to be
+    #   considered detected this frame (below this → use prior polynomial).
+    min_lane_pixels: 200
+
+    # min_valid_windows: minimum number of windows that passed min_pixels for
+    #   a polynomial fit to be attempted this frame.
+    min_valid_windows: 4
+
+    # prior_expiry_frames: frames of no fresh detection before the stored
+    #   prior polynomial is discarded.  After expiry the single-lane fallback
+    #   (synthesise from the other lane + average width) kicks in.
+    #   At 10fps, 5 frames = 0.5s of grace period.
+    prior_expiry_frames: 5
+
+    # ── Error computation ─────────────────────────────────────────────────
+    # alpha_smooth: exponential smoothing factor for the published error.
+    #   0.0 = ignore new data (output never changes)
+    #   1.0 = no smoothing (raw per-frame error)
+    #   At 10fps use higher alpha (less smoothing) since frames are already sparse.
+    alpha_smooth: 0.7
+
+    # base_lookahead: fraction of image height (from top) at which the lane
+    #   midpoint is evaluated on straight sections.
+    #   0.3 = very close/reactive  |  0.9 = far/anticipatory
+    #   Adaptive logic shortens this automatically when |error| is large.
+    base_lookahead: 0.6
+
+    # cold_start_frames: use histogram-based lane seeding for this many frames
+    #   at startup (before switching to prior-based tracking).
+    cold_start_frames: 5
+
+    # ── Camera blind zone compensation ────────────────────────────────────
+    # bottom_crop_fraction: fraction of the BOTTOM of the bird's-eye image
+    #   to exclude from lane detection.
+    #
+    # The camera cannot see the ground directly below itself.  Data from
+    # that blind zone appears at the bottom of the warped image and shows
+    # lane lines already curving into a turn, pulling the polynomial early.
+    #
+    # Set this to:  blind_zone_cm / visible_track_length_cm
+    # Example:  10 cm blind zone, camera sees ~60 cm ahead → 10/60 ≈ 0.15
+    #
+    # Start at 0.0, increase in steps of 0.05 until early-turning stops.
+    # Too high → loses the near-field entirely and may miss tight curves.
+    bottom_crop_fraction: 0.15
+
+    # ── White-line / special zone detection ───────────────────────────────
+    # The track has a section with broken WHITE lines (instead of yellow)
+    # followed by a forced left turn.
+    #
+    # white_s_max / white_v_min: HSV thresholds for white.
+    #   White = any hue, low saturation, high brightness.
+    white_s_max: 50
+    white_v_min: 160
+
+    # yellow_lost_thresh: yellow mask pixel count below which yellow is
+    #   considered "gone" for zone-entry detection.
+    yellow_lost_thresh: 400
+
+    # white_found_thresh: white mask pixel count above which white lines
+    #   are considered "present".
+    white_found_thresh: 200
+
+    # white_zone_entry_frames: consecutive frames satisfying both thresholds
+    #   before the WHITE_ZONE state is entered (prevents false positives).
+    white_zone_entry_frames: 6
+
+    # white_zone_exit_frames: consecutive frames with NO lines at all
+    #   (after being in WHITE_ZONE) before TURN_LEFT is triggered.
+    white_zone_exit_frames: 8

@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# WSL / Windows metadata
+*:Zone.Identifier
+
+# Editors
+.vscode/
+.idea/
+*.swp

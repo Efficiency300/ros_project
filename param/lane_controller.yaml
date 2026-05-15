@@ -1,0 +1,69 @@
+lane_controller_node:
+  ros__parameters:
+
+    # ── PID gains ─────────────────────────────────────────────────────────
+    # Start here and tune with the robot on the track:
+    #
+    #   Symptom: robot barely reacts / drifts to one side
+    #     → increase kp
+    #
+    #   Symptom: robot weaves / oscillates back and forth
+    #     → reduce kp  OR  increase kd
+    #
+    #   Symptom: persistent small offset on straight sections
+    #     → introduce small ki (e.g. 0.05) – use sparingly
+    #
+    # The derivative term (kd) anticipates turns by reacting to the RATE
+    # of error change, not just the error itself.  This is what prevents
+    # the robot from overshooting the apex of a curve.
+    kp: 1.2
+    ki: 0.0
+    kd: 0.3
+
+    # Anti-windup: clamps the integral accumulator to ±ki_max.
+    # Prevents the robot from spinning in circles after a long off-centre run.
+    ki_max: 0.5
+
+    # ── Velocity limits ───────────────────────────────────────────────────
+    # base_speed: forward speed on straight sections (m/s).
+    # Start conservatively (0.08–0.10); increase once PID is tuned.
+    # TurtleBot3 Burger maximum recommended indoor speed ≈ 0.22 m/s.
+    base_speed: 0.10
+
+    # max_angular_vel: clamp on the PID angular output (rad/s).
+    # Burger physical limit ≈ 2.84 rad/s; stay well below to avoid wheel slip.
+    max_angular_vel: 1.5
+
+    # speed_reduction_factor: controls how aggressively the robot slows in turns.
+    # Formula: speed = base_speed * max(0.3, 1.0 - error² * factor)
+    # Higher → slower in curves.  At factor=1.5, full-error (=1.0) → 30% speed.
+    speed_reduction_factor: 1.5
+
+    # ── Hardware tuning ───────────────────────────────────────────────────
+    # angular_deadzone: angular commands smaller than this are set to 0.
+    # Prevents sending micro-corrections that the motors cannot execute,
+    # which would otherwise cause PWM buzz without actual movement.
+    angular_deadzone: 0.05
+
+    # safety_timeout: seconds without a valid /lane/center_error message
+    # before the robot is stopped.  Covers: lane detector crash, WiFi dropout,
+    # node not started, camera failure.
+    safety_timeout: 2.0
+
+    # ── Special zone: forced left turn ────────────────────────────────────
+    # When the lane detector publishes zone_state=TURN_LEFT (white dashed
+    # section ended), the controller ignores PID and drives a fixed left turn.
+    #
+    # turn_left_speed: forward speed during the turn (m/s).
+    #   Keep low so the turn radius stays tight.
+    turn_left_speed: 0.05
+
+    # turn_left_angular: angular velocity during the turn (rad/s).
+    #   Positive = left turn in ROS convention.
+    #   Tune this so the robot ends up aligned with the next yellow lane.
+    turn_left_angular: 1.0
+
+    # turn_left_duration: how long to execute the forced turn (seconds).
+    #   Measure by testing: place robot at the white-zone exit and time
+    #   how long it takes to align with the yellow lane.
+    turn_left_duration: 2.0
