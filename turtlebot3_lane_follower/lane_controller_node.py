@@ -82,8 +82,12 @@ class LaneControllerNode(Node):
         # PID output was tiny — biases the robot to keep curving.
         self.declare_parameter('nan_coast_min_angular', 0.6)
 
-        # Parking: when zone_state=PARKING, decelerate over this many seconds
-        # to zero and stop.
+        # Parking: when zone_state=PARKING, first STEER toward the red blob's
+        # centroid for `parking_align_duration` seconds at low speed, then
+        # decelerate to zero over `parking_brake_duration` seconds.
+        self.declare_parameter('parking_align_duration', 0.8)
+        self.declare_parameter('parking_align_speed', 0.05)
+        self.declare_parameter('parking_align_kp', 1.5)
         self.declare_parameter('parking_brake_duration', 1.0)
 
         self._read_parameters()
@@ -104,6 +108,8 @@ class LaneControllerNode(Node):
         # Parking state
         self._parking = False
         self._parking_start: rclpy.time.Time | None = None
+        # Latest normalised red-marker centroid x ([-1,1] or NaN if unseen)
+        self._red_centroid_x: float = float('nan')
 
         # ── Turn-left state ───────────────────────────────────────────────
         self._turning = False        # True while executing forced left turn
@@ -124,6 +130,13 @@ class LaneControllerNode(Node):
             Int8,
             '/lane/zone_state',
             self.zone_state_callback,
+            qos,
+        )
+
+        self.red_centroid_sub = self.create_subscription(
+            Float32,
+            '/lane/red_centroid',
+            self.red_centroid_callback,
             qos,
         )
 
@@ -160,6 +173,12 @@ class LaneControllerNode(Node):
         self.nan_coast_duration    = float(self.get_parameter('nan_coast_duration').value)
         self.nan_coast_speed       = float(self.get_parameter('nan_coast_speed').value)
         self.nan_coast_min_angular = float(self.get_parameter('nan_coast_min_angular').value)
+        self.parking_align_duration = float(
+            self.get_parameter('parking_align_duration').value)
+        self.parking_align_speed = float(
+            self.get_parameter('parking_align_speed').value)
+        self.parking_align_kp = float(
+            self.get_parameter('parking_align_kp').value)
         self.parking_brake_duration = float(
             self.get_parameter('parking_brake_duration').value)
 
@@ -306,16 +325,40 @@ class LaneControllerNode(Node):
         self.last_angular_z = 0.0
 
     def _drive_parking_brake(self, now):
-        """Linearly decay last_linear_x to zero over parking_brake_duration."""
+        """
+        Two-phase parking:
+          1. Align — steer toward the red marker's centroid at low speed
+             so we end up centred laterally on it.
+          2. Brake — linearly decay linear_x to zero.
+        """
         elapsed = (now - self._parking_start).nanoseconds * 1e-9
-        if elapsed >= self.parking_brake_duration:
+
+        # ── Phase 1: align toward red centroid ───────────────────────────
+        if elapsed < self.parking_align_duration:
+            cx = self._red_centroid_x
+            if math.isnan(cx):
+                # Red briefly out of view — crawl straight at align speed
+                # until either it returns or we move to braking.
+                self._publish_twist(self.parking_align_speed, 0.0)
+                return
+            # cx > 0 → marker to the right → turn right → negative angular_z
+            angular_z = -self.parking_align_kp * cx
+            angular_z = max(-self.max_angular_vel,
+                            min(self.max_angular_vel, angular_z))
+            self._publish_twist(self.parking_align_speed, angular_z)
+            return
+
+        # ── Phase 2: brake ───────────────────────────────────────────────
+        brake_elapsed = elapsed - self.parking_align_duration
+        if brake_elapsed >= self.parking_brake_duration:
             self._publish_stop()
             return
-        ratio = 1.0 - (elapsed / self.parking_brake_duration)
-        linear_x = self.last_linear_x * ratio
-        # Hold heading steady while braking — small leftover angular only.
-        angular_z = self.last_angular_z * ratio * 0.5
-        self._publish_twist(linear_x, angular_z)
+        ratio = 1.0 - (brake_elapsed / self.parking_brake_duration)
+        linear_x = self.parking_align_speed * ratio
+        self._publish_twist(linear_x, 0.0)
+
+    def red_centroid_callback(self, msg: Float32):
+        self._red_centroid_x = float(msg.data)
 
     def _reset_pid(self):
         self.integral = 0.0
@@ -327,6 +370,7 @@ class LaneControllerNode(Node):
     # ─────────────────────────────────────────────────────────────────────
 
     def zone_state_callback(self, msg: Int8):
+        NORMAL    = 0
         TURN_LEFT = 2
         PARKING   = 3
         if msg.data == PARKING and not self._parking:
@@ -342,7 +386,14 @@ class LaneControllerNode(Node):
             self._turn_start = self.get_clock().now()
             self._reset_pid()
             self.get_logger().info(
-                f'TURN_LEFT received — turning left for {self.turn_left_duration}s')
+                f'TURN_LEFT received — turning until yellow returns '
+                f'(safety timeout {self.turn_left_duration}s)')
+        elif msg.data == NORMAL and self._turning:
+            # Detector saw yellow again → close the loop, exit the forced turn
+            # immediately instead of waiting for the open-loop timeout.
+            self._turning = False
+            self._reset_pid()
+            self.get_logger().info('Turn closed-loop: yellow re-acquired, resuming PID')
 
 
 def main(args=None):

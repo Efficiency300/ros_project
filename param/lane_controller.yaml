@@ -65,10 +65,13 @@ lane_controller_node:
     #   Tune this so the robot ends up aligned with the next yellow lane.
     turn_left_angular: 1.0
 
-    # turn_left_duration: how long to execute the forced turn (seconds).
-    #   Measure by testing: place robot at the white-zone exit and time
-    #   how long it takes to align with the yellow lane.
-    turn_left_duration: 2.0
+    # turn_left_duration: safety-net timeout for the forced left turn (s).
+    #   The controller now exits the turn as soon as the detector reports
+    #   zone_state=NORMAL again (yellow re-acquired), so this is just the
+    #   maximum time we allow the open-loop turn to run if something else
+    #   goes wrong (e.g. detector silent). Keep it generously larger than
+    #   the worst-case turn time on the track.
+    turn_left_duration: 5.0
 
     # ── NaN-coast (lane lost) ─────────────────────────────────────────────
     # When the detector reports NaN (lane completely lost) the controller

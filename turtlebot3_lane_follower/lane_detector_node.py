@@ -192,6 +192,10 @@ class LaneDetectorNode(Node):
 
         self.zone_pub = self.create_publisher(Int8, '/lane/zone_state',
                                                QoSProfile(depth=10))
+        # Normalised red-marker x centroid: -1=far left … +1=far right of
+        # the bird's-eye view. NaN published when no red is in view.
+        self.red_centroid_pub = self.create_publisher(
+            Float32, '/lane/red_centroid', QoSProfile(depth=10))
 
         # ── subscriber (best-effort, depth=1 → always latest frame) ──────
         self.img_sub = self.create_subscription(
@@ -355,6 +359,14 @@ class LaneDetectorNode(Node):
             red_mask[-crop_rows:, :] = 0
         red_px = int(np.count_nonzero(red_mask))
 
+        red_centroid_msg = Float32()
+        if red_px > 0:
+            red_ys, red_xs = red_mask.nonzero()
+            red_centroid_msg.data = float((np.mean(red_xs) - w / 2.0) / (w / 2.0))
+        else:
+            red_centroid_msg.data = float('nan')
+        self.red_centroid_pub.publish(red_centroid_msg)
+
         # In WHITE_ZONE: combine yellow + white so either colour is tracked
         if self.zone_state == ZoneState.WHITE_ZONE:
             mask = cv2.bitwise_or(mask, white_mask)
@@ -398,6 +410,34 @@ class LaneDetectorNode(Node):
             if self.right_stale_frames > self.prior_expiry_frames:
                 self.prev_right_poly = None
                 self.prev_right_x = None
+
+        # ── 9b. Cross-line check ───────────────────────────────────────────
+        # If the bottom-of-image x of left_poly is right of right_poly's, the
+        # sliding windows latched the wrong halves of the image (common on
+        # tight loops where the "inside" line wraps past image centre). Drop
+        # the side that had fewer pixels this frame; _synthesise_lane will
+        # rebuild it from the surviving lane + width history.
+        if left_poly is not None and right_poly is not None:
+            lx_bot = float(np.polyval(left_poly,  effective_h))
+            rx_bot = float(np.polyval(right_poly, effective_h))
+            if lx_bot >= rx_bot:
+                if left_pixels >= right_pixels:
+                    # Right side is the suspect — drop it.
+                    right_poly = None
+                    right_fresh = False
+                    self.prev_right_poly = None
+                    self.prev_right_x = None
+                    self.right_stale_frames = self.prior_expiry_frames + 1
+                else:
+                    left_poly = None
+                    left_fresh = False
+                    self.prev_left_poly = None
+                    self.prev_left_x = None
+                    self.left_stale_frames = self.prior_expiry_frames + 1
+                self.get_logger().warn(
+                    f'Cross-line rejected (lx={lx_bot:.0f} >= rx={rx_bot:.0f})',
+                    throttle_duration_sec=1.0,
+                )
 
         # ── 10. Update rolling lane-width history ──────────────────────────
         if left_fresh and right_fresh:
