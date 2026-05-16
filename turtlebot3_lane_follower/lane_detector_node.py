@@ -34,6 +34,7 @@ class ZoneState(IntEnum):
     NORMAL     = 0   # following yellow lines normally
     WHITE_ZONE = 1   # white dashed lines detected, yellow absent
     TURN_LEFT  = 2   # white zone ended, controller should turn left
+    PARKING    = 3   # red marker dominates view → stop on it
 
 
 class LaneDetectorNode(Node):
@@ -127,6 +128,26 @@ class LaneDetectorNode(Node):
         self.declare_parameter('white_zone_entry_frames', 6)
         self.declare_parameter('white_zone_exit_frames',  8)
 
+        # ── Red parking marker detection ──────────────────────────────────
+        # Red wraps around H=0/179 so two HSV ranges are needed.
+        self.declare_parameter('red_h1_max', 10)
+        self.declare_parameter('red_h2_min', 160)
+        self.declare_parameter('red_s_min', 120)
+        self.declare_parameter('red_v_min', 80)
+        # red pixel count above which red marker is considered "in view"
+        self.declare_parameter('red_found_thresh', 1500)
+        # consecutive frames required to confirm parking entry
+        self.declare_parameter('parking_entry_frames', 5)
+        # frames at start during which red is ignored (avoid latching on the
+        # start marker right under the robot).
+        self.declare_parameter('parking_arm_frames', 80)
+
+        # ── Polynomial sanity (reject "lane goes sideways" fits) ──────────
+        # Reject a fit if the lane's tangent at the bottom is more horizontal
+        # than this many image-x-pixels per image-y-pixel.  Stops the loop /
+        # wrap-around backwards-driving symptom.
+        self.declare_parameter('max_bottom_slope', 4.0)
+
         self._read_parameters()
 
         # ── state ─────────────────────────────────────────────────────────
@@ -159,6 +180,7 @@ class LaneDetectorNode(Node):
         self.zone_state        = ZoneState.NORMAL
         self._white_entry_cnt  = 0   # consecutive frames with white detected
         self._no_line_cnt      = 0   # consecutive frames with no lines (in WHITE_ZONE)
+        self._red_entry_cnt    = 0   # consecutive frames with red marker visible
 
         # ── publishers ────────────────────────────────────────────────────
         qos = QoSProfile(depth=10)
@@ -235,6 +257,15 @@ class LaneDetectorNode(Node):
         self.white_zone_exit_frames  = int(
             self.get_parameter('white_zone_exit_frames').value)
 
+        self.red_h1_max = int(self.get_parameter('red_h1_max').value)
+        self.red_h2_min = int(self.get_parameter('red_h2_min').value)
+        self.red_s_min  = int(self.get_parameter('red_s_min').value)
+        self.red_v_min  = int(self.get_parameter('red_v_min').value)
+        self.red_found_thresh    = int(self.get_parameter('red_found_thresh').value)
+        self.parking_entry_frames = int(self.get_parameter('parking_entry_frames').value)
+        self.parking_arm_frames   = int(self.get_parameter('parking_arm_frames').value)
+        self.max_bottom_slope = float(self.get_parameter('max_bottom_slope').value)
+
     # ─────────────────────────────────────────────────────────────────────
     # Main image callback
     # ─────────────────────────────────────────────────────────────────────
@@ -299,8 +330,9 @@ class LaneDetectorNode(Node):
 
         # ── 5c. White line mask + zone-state pixel counts ──────────────────
         yellow_px = int(np.count_nonzero(mask))
+        hsv_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
         white_mask = cv2.inRange(
-            cv2.cvtColor(warped, cv2.COLOR_BGR2HSV),
+            hsv_warped,
             np.array([0,   0,              self.white_v_min], dtype=np.uint8),
             np.array([179, self.white_s_max, 255           ], dtype=np.uint8),
         )
@@ -308,6 +340,20 @@ class LaneDetectorNode(Node):
         if crop_rows > 0:
             white_mask[-crop_rows:, :] = 0
         white_px = int(np.count_nonzero(white_mask))
+
+        # Red (wraps around H=0/179, so OR of two ranges).
+        red_lower1 = np.array([0,                 self.red_s_min, self.red_v_min], dtype=np.uint8)
+        red_upper1 = np.array([self.red_h1_max,   255,            255           ], dtype=np.uint8)
+        red_lower2 = np.array([self.red_h2_min,   self.red_s_min, self.red_v_min], dtype=np.uint8)
+        red_upper2 = np.array([179,               255,            255           ], dtype=np.uint8)
+        red_mask = cv2.bitwise_or(
+            cv2.inRange(hsv_warped, red_lower1, red_upper1),
+            cv2.inRange(hsv_warped, red_lower2, red_upper2),
+        )
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+        if crop_rows > 0:
+            red_mask[-crop_rows:, :] = 0
+        red_px = int(np.count_nonzero(red_mask))
 
         # In WHITE_ZONE: combine yellow + white so either colour is tracked
         if self.zone_state == ZoneState.WHITE_ZONE:
@@ -324,9 +370,11 @@ class LaneDetectorNode(Node):
 
         # ── 8. Polynomial fitting ───────────────────────────────────────────
         left_poly, left_fresh = self._fit_polynomial(
-            left_cents, left_pixels, left_valid_wins, self.prev_left_poly)
+            left_cents, left_pixels, left_valid_wins,
+            self.prev_left_poly, effective_h)
         right_poly, right_fresh = self._fit_polynomial(
-            right_cents, right_pixels, right_valid_wins, self.prev_right_poly)
+            right_cents, right_pixels, right_valid_wins,
+            self.prev_right_poly, effective_h)
 
         # ── 9. Update state from fresh detections ──────────────────────────
         if left_fresh:
@@ -411,7 +459,8 @@ class LaneDetectorNode(Node):
         self.error_pub.publish(error_msg)
 
         # ── 13. Zone state machine + publish ──────────────────────────────
-        self._update_zone_state(yellow_px, white_px, left_poly, right_poly)
+        self._update_zone_state(
+            yellow_px, white_px, red_px, left_poly, right_poly)
         zone_msg = Int8()
         zone_msg.data = int(self.zone_state)
         self.zone_pub.publish(zone_msg)
@@ -510,7 +559,8 @@ class LaneDetectorNode(Node):
 
         return centroids, total_pixels, valid_windows
 
-    def _fit_polynomial(self, centroids, total_pixels, valid_windows, prev_poly):
+    def _fit_polynomial(self, centroids, total_pixels, valid_windows,
+                        prev_poly, h):
         """
         Fit a 2nd-order polynomial x = f(y) through the sliding window centroids.
 
@@ -525,7 +575,16 @@ class LaneDetectorNode(Node):
             x_vals = np.array([c[1] for c in centroids], dtype=np.float32)
             try:
                 poly = np.polyfit(y_vals, x_vals, 2)
-                return poly, True
+                # Sanity: reject fits where the lane runs nearly horizontally
+                # at the bottom of the image — that means the sliding window
+                # latched onto a loop's far side, which would drive the robot
+                # backwards. Slope = dx/dy at y = h.
+                slope_bottom = 2.0 * poly[0] * h + poly[1]
+                if abs(slope_bottom) > self.max_bottom_slope:
+                    # Treat as failed fit; fall through to prior.
+                    pass
+                else:
+                    return poly, True
             except (np.linalg.LinAlgError, Exception):
                 pass  # fall through to prior
 
@@ -551,8 +610,25 @@ class LaneDetectorNode(Node):
     # Zone state machine
     # ─────────────────────────────────────────────────────────────────────
 
-    def _update_zone_state(self, yellow_px, white_px, left_poly, right_poly):
+    def _update_zone_state(self, yellow_px, white_px, red_px,
+                            left_poly, right_poly):
         any_line = (left_poly is not None or right_poly is not None)
+
+        # Red marker has highest priority once armed: as soon as enough red
+        # pixels are seen for several consecutive frames, switch to PARKING
+        # and stay there. The arm-frame guard prevents the start marker from
+        # latching parking immediately.
+        if (self.zone_state != ZoneState.PARKING
+                and self.frame_count > self.parking_arm_frames
+                and red_px > self.red_found_thresh):
+            self._red_entry_cnt += 1
+            if self._red_entry_cnt >= self.parking_entry_frames:
+                self.zone_state = ZoneState.PARKING
+                self.get_logger().info(
+                    f'Zone → PARKING  (red_px={red_px})')
+                return
+        else:
+            self._red_entry_cnt = 0
 
         if self.zone_state == ZoneState.NORMAL:
             # Enter WHITE_ZONE when yellow disappears and white appears
@@ -591,6 +667,8 @@ class LaneDetectorNode(Node):
                 self._white_entry_cnt = 0
                 self._no_line_cnt = 0
                 self.get_logger().info('Zone → NORMAL  (yellow re-acquired after turn)')
+
+        # PARKING is terminal — no exit transitions.
 
     # ─────────────────────────────────────────────────────────────────────
     # Debug visualisation
@@ -662,6 +740,7 @@ class LaneDetectorNode(Node):
             ZoneState.NORMAL:     (180, 180, 180),
             ZoneState.WHITE_ZONE: (255, 255,   0),
             ZoneState.TURN_LEFT:  (0,   80,  255),
+            ZoneState.PARKING:    (0,    0,  255),
         }
         cv2.putText(
             debug,

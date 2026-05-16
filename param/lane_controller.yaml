@@ -16,9 +16,9 @@ lane_controller_node:
     # The derivative term (kd) anticipates turns by reacting to the RATE
     # of error change, not just the error itself.  This is what prevents
     # the robot from overshooting the apex of a curve.
-    kp: 1.2
+    kp: 1.6
     ki: 0.0
-    kd: 0.3
+    kd: 0.45
 
     # Anti-windup: clamps the integral accumulator to ±ki_max.
     # Prevents the robot from spinning in circles after a long off-centre run.
@@ -32,12 +32,14 @@ lane_controller_node:
 
     # max_angular_vel: clamp on the PID angular output (rad/s).
     # Burger physical limit ≈ 2.84 rad/s; stay well below to avoid wheel slip.
-    max_angular_vel: 1.5
+    # Bumped to 2.2 so the tight corners of the Sbot track can actually be
+    # taken at base_speed without the controller hitting the clamp early.
+    max_angular_vel: 2.2
 
     # speed_reduction_factor: controls how aggressively the robot slows in turns.
     # Formula: speed = base_speed * max(0.3, 1.0 - error² * factor)
-    # Higher → slower in curves.  At factor=1.5, full-error (=1.0) → 30% speed.
-    speed_reduction_factor: 1.5
+    # Higher → slower in curves.  At factor=2.5, error=0.6 → ~30% speed.
+    speed_reduction_factor: 2.5
 
     # ── Hardware tuning ───────────────────────────────────────────────────
     # angular_deadzone: angular commands smaller than this are set to 0.
@@ -67,3 +69,21 @@ lane_controller_node:
     #   Measure by testing: place robot at the white-zone exit and time
     #   how long it takes to align with the yellow lane.
     turn_left_duration: 2.0
+
+    # ── NaN-coast (lane lost) ─────────────────────────────────────────────
+    # When the detector reports NaN (lane completely lost) the controller
+    # used to stop instantly. Now it coasts in the last known direction for
+    # `nan_coast_duration` seconds first — this keeps the robot turning
+    # through brief blind spots in tight curves instead of giving up.
+    nan_coast_duration: 1.5
+    # Slow crawl forward while coasting (m/s).
+    nan_coast_speed: 0.05
+    # Minimum |ω| applied during a coast. If the PID's last command was a
+    # tiny correction, falling back to that magnitude would just drive the
+    # robot straight off the lane. This floor keeps it committed to the turn.
+    nan_coast_min_angular: 0.6
+
+    # ── Parking ───────────────────────────────────────────────────────────
+    # When zone_state=PARKING (red marker detected by detector), brake to
+    # zero linearly over this many seconds, then hold stopped.
+    parking_brake_duration: 1.0

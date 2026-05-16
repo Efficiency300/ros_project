@@ -69,8 +69,10 @@ lane_detector_node:
     # prior_expiry_frames: frames of no fresh detection before the stored
     #   prior polynomial is discarded.  After expiry the single-lane fallback
     #   (synthesise from the other lane + average width) kicks in.
-    #   At 10fps, 5 frames = 0.5s of grace period.
-    prior_expiry_frames: 5
+    #   At 10fps, 12 frames ≈ 1.2 s of grace period — enough to glide through
+    #   tight corners on the Sbot track where the inside line briefly drops
+    #   out of the bird's-eye view.
+    prior_expiry_frames: 12
 
     # ── Error computation ─────────────────────────────────────────────────
     # alpha_smooth: exponential smoothing factor for the published error.
@@ -83,7 +85,9 @@ lane_detector_node:
     #   midpoint is evaluated on straight sections.
     #   0.3 = very close/reactive  |  0.9 = far/anticipatory
     #   Adaptive logic shortens this automatically when |error| is large.
-    base_lookahead: 0.6
+    #   0.55 keeps the robot reactive enough for the Sbot S-curves while
+    #   still anticipating gentle curves on the long straights.
+    base_lookahead: 0.55
 
     # cold_start_frames: use histogram-based lane seeding for this many frames
     #   at startup (before switching to prior-based tracking).
@@ -128,3 +132,34 @@ lane_detector_node:
     # white_zone_exit_frames: consecutive frames with NO lines at all
     #   (after being in WHITE_ZONE) before TURN_LEFT is triggered.
     white_zone_exit_frames: 8
+
+    # ── Red parking marker ────────────────────────────────────────────────
+    # Red wraps the OpenCV hue circle so two ranges are OR'd together.
+    # Lane finish/parking marker on the track is solid red — tune so it
+    # shows up as a solid blob in /lane/image_yellow_mask (debug overlay
+    # currently shares mask topic) without bleeding into orange/pink.
+    red_h1_max: 10        # 0…red_h1_max  (low-hue red half)
+    red_h2_min: 160       # red_h2_min…179 (high-hue red half)
+    red_s_min: 120
+    red_v_min: 80
+
+    # Red pixel count above which the parking marker counts as "in view".
+    # Track marker is large — keep threshold high enough to ignore the
+    # small start chip behind the robot once we start driving.
+    red_found_thresh: 1500
+
+    # Consecutive frames with red present needed to commit to PARKING.
+    parking_entry_frames: 5
+
+    # Frames at start during which red is IGNORED — prevents the robot
+    # parking on the start marker behind it. At ~10 fps, 80 frames ≈ 8 s,
+    # enough to clear the start area before parking becomes possible.
+    parking_arm_frames: 80
+
+    # ── Polynomial sanity check ───────────────────────────────────────────
+    # Reject a polynomial fit if the lane's slope at the bottom of the
+    # image exceeds this many x-pixels per y-pixel. Stops the detector
+    # from latching on to the OTHER side of a loop and driving the robot
+    # backwards. 4.0 ≈ 76° from vertical — anything steeper than that is
+    # never a valid forward-facing lane.
+    max_bottom_slope: 4.0

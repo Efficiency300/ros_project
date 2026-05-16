@@ -72,6 +72,20 @@ class LaneControllerNode(Node):
         self.declare_parameter('turn_left_angular',  1.0)    # rad/s (positive=left)
         self.declare_parameter('turn_left_duration', 2.0)    # seconds
 
+        # NaN-coast: when the lane detector publishes NaN (lane lost), keep
+        # turning in the last known direction for this many seconds at
+        # `nan_coast_speed` instead of stopping immediately. Prevents the
+        # robot from giving up mid-corner.
+        self.declare_parameter('nan_coast_duration', 1.5)
+        self.declare_parameter('nan_coast_speed', 0.05)
+        # Minimum magnitude of angular_z used during a coast when the last
+        # PID output was tiny — biases the robot to keep curving.
+        self.declare_parameter('nan_coast_min_angular', 0.6)
+
+        # Parking: when zone_state=PARKING, decelerate over this many seconds
+        # to zero and stop.
+        self.declare_parameter('parking_brake_duration', 1.0)
+
         self._read_parameters()
 
         # ── PID state ─────────────────────────────────────────────────────
@@ -79,6 +93,17 @@ class LaneControllerNode(Node):
         self.prev_error = 0.0
         self.prev_time = None
         self.last_msg_time = None
+
+        # Last valid command sent — used for NaN-coast and gentle stops.
+        self.last_angular_z = 0.0
+        self.last_linear_x  = 0.0
+
+        # NaN-coast state
+        self._nan_coast_start: rclpy.time.Time | None = None
+
+        # Parking state
+        self._parking = False
+        self._parking_start: rclpy.time.Time | None = None
 
         # ── Turn-left state ───────────────────────────────────────────────
         self._turning = False        # True while executing forced left turn
@@ -132,6 +157,11 @@ class LaneControllerNode(Node):
         self.turn_left_speed    = float(self.get_parameter('turn_left_speed').value)
         self.turn_left_angular  = float(self.get_parameter('turn_left_angular').value)
         self.turn_left_duration = float(self.get_parameter('turn_left_duration').value)
+        self.nan_coast_duration    = float(self.get_parameter('nan_coast_duration').value)
+        self.nan_coast_speed       = float(self.get_parameter('nan_coast_speed').value)
+        self.nan_coast_min_angular = float(self.get_parameter('nan_coast_min_angular').value)
+        self.parking_brake_duration = float(
+            self.get_parameter('parking_brake_duration').value)
 
     # ─────────────────────────────────────────────────────────────────────
     # Error callback
@@ -141,14 +171,16 @@ class LaneControllerNode(Node):
         now = self.get_clock().now()
         self.last_msg_time = now
 
+        # Parking has highest priority — brake to zero, then hold.
+        if self._parking:
+            self._drive_parking_brake(now)
+            return
+
         # During a forced left turn, ignore the error signal
         if self._turning:
             elapsed = (now - self._turn_start).nanoseconds * 1e-9
             if elapsed < self.turn_left_duration:
-                twist = Twist()
-                twist.linear.x  = self.turn_left_speed
-                twist.angular.z = self.turn_left_angular
-                self.cmd_vel_pub.publish(twist)
+                self._publish_twist(self.turn_left_speed, self.turn_left_angular)
                 return
             else:
                 # Turn complete — resume PID
@@ -158,12 +190,39 @@ class LaneControllerNode(Node):
 
         error = float(msg.data)
 
-        # NaN → lane completely lost, stop and reset PID state
+        # NaN → lane lost. Coast in the last known direction for a short
+        # window before giving up. This stops the robot from freezing mid
+        # corner / on brief blind spots.
         if math.isnan(error):
+            if self._nan_coast_start is None:
+                self._nan_coast_start = now
+            elapsed = (now - self._nan_coast_start).nanoseconds * 1e-9
+            if elapsed < self.nan_coast_duration:
+                # Bias angular toward the last commanded sign with a floor —
+                # tiny last_angular_z would otherwise just stop the robot
+                # straight into whatever wall it lost the lane next to.
+                sign = 1.0 if self.last_angular_z >= 0.0 else -1.0
+                a = self.last_angular_z
+                if abs(a) < self.nan_coast_min_angular:
+                    a = sign * self.nan_coast_min_angular
+                a = max(-self.max_angular_vel, min(self.max_angular_vel, a))
+                self._publish_twist(self.nan_coast_speed, a)
+                self.get_logger().warn(
+                    f'Lane lost — coasting ({elapsed:.2f}s, ω={a:+.2f})',
+                    throttle_duration_sec=1.0,
+                )
+                return
+            # Coast window expired — full stop.
             self._publish_stop()
-            self.get_logger().warn('Lane lost (NaN) – robot stopped', throttle_duration_sec=2.0)
+            self.get_logger().warn(
+                'Lane lost (NaN) — coast expired, robot stopped',
+                throttle_duration_sec=2.0,
+            )
             self._reset_pid()
             return
+
+        # Valid error received → reset the NaN-coast timer.
+        self._nan_coast_start = None
 
         # ── dt ────────────────────────────────────────────────────────────
         if self.prev_time is None:
@@ -205,11 +264,7 @@ class LaneControllerNode(Node):
         speed_scale = max(0.3, 1.0 - (error ** 2) * self.speed_reduction_factor)
         linear_x = self.base_speed * speed_scale
 
-        # ── Publish ───────────────────────────────────────────────────────
-        twist = Twist()
-        twist.linear.x = linear_x
-        twist.angular.z = angular_z
-        self.cmd_vel_pub.publish(twist)
+        self._publish_twist(linear_x, angular_z)
 
     # ─────────────────────────────────────────────────────────────────────
     # Safety watchdog
@@ -237,8 +292,30 @@ class LaneControllerNode(Node):
     # Helpers
     # ─────────────────────────────────────────────────────────────────────
 
+    def _publish_twist(self, linear_x: float, angular_z: float):
+        twist = Twist()
+        twist.linear.x  = float(linear_x)
+        twist.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(twist)
+        self.last_linear_x  = float(linear_x)
+        self.last_angular_z = float(angular_z)
+
     def _publish_stop(self):
         self.cmd_vel_pub.publish(Twist())
+        self.last_linear_x  = 0.0
+        self.last_angular_z = 0.0
+
+    def _drive_parking_brake(self, now):
+        """Linearly decay last_linear_x to zero over parking_brake_duration."""
+        elapsed = (now - self._parking_start).nanoseconds * 1e-9
+        if elapsed >= self.parking_brake_duration:
+            self._publish_stop()
+            return
+        ratio = 1.0 - (elapsed / self.parking_brake_duration)
+        linear_x = self.last_linear_x * ratio
+        # Hold heading steady while braking — small leftover angular only.
+        angular_z = self.last_angular_z * ratio * 0.5
+        self._publish_twist(linear_x, angular_z)
 
     def _reset_pid(self):
         self.integral = 0.0
@@ -251,7 +328,16 @@ class LaneControllerNode(Node):
 
     def zone_state_callback(self, msg: Int8):
         TURN_LEFT = 2
-        if msg.data == TURN_LEFT and not self._turning:
+        PARKING   = 3
+        if msg.data == PARKING and not self._parking:
+            self._parking = True
+            self._parking_start = self.get_clock().now()
+            self._turning = False
+            self._reset_pid()
+            self.get_logger().info(
+                f'PARKING received — braking over {self.parking_brake_duration}s')
+            return
+        if msg.data == TURN_LEFT and not self._turning and not self._parking:
             self._turning = True
             self._turn_start = self.get_clock().now()
             self._reset_pid()
